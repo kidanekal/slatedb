@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flatbuffers::DefaultAllocator;
 
 use crate::block::Block;
@@ -81,9 +81,27 @@ impl SsTableFormat {
         filter_bytes: Bytes,
         compression_codec: Option<CompressionCodec>,
     ) -> Result<BloomFilter, SlateDBError> {
+        if filter_bytes.len() <= 4 {
+            return Err(SlateDBError::EmptyBlockMeta);
+        }
+        eprintln!("min_filter_keys: {}", self.min_filter_keys);
+        eprintln!("Compression codec at decode_filter: {:?}", compression_codec.clone());
+        if self.min_filter_keys == 0 {
+            return Ok(BloomFilter::decode(&filter_bytes));
+        }
+        let checksum_size = std::mem::size_of::<u32>();
+        let data = filter_bytes.slice(..filter_bytes.len() - checksum_size);
+        let stored_checksum = filter_bytes
+            .slice(filter_bytes.len() - checksum_size..)
+            .get_u32();
+        let actual_checksum = crc32fast::hash(&data);
+        if stored_checksum != actual_checksum {
+            println!("Checksum mismatch: stored {} !=  actual {}", stored_checksum, actual_checksum);
+            return Err(SlateDBError::ChecksumMismatch);
+        }
         let filter_bytes = match compression_codec {
-            Some(c) => Self::decompress(filter_bytes, c)?,
-            None => filter_bytes,
+            Some(c) => Self::decompress(data, c)?,
+            None => data,
         };
         Ok(BloomFilter::decode(&filter_bytes))
     }
@@ -118,9 +136,17 @@ impl SsTableFormat {
         index_bytes: Bytes,
         compression_codec: Option<CompressionCodec>,
     ) -> Result<SsTableIndexOwned, SlateDBError> {
+        if index_bytes.len() <= 4 {
+            return Err(SlateDBError::EmptyBlockMeta);
+        }
+        let data = index_bytes.slice(..index_bytes.len() - 4);
+        let checksum = index_bytes.slice(index_bytes.len() - 4..).get_u32();
+        if checksum != crc32fast::hash(&data) {
+            return Err(SlateDBError::ChecksumMismatch);
+        }
         let index_bytes = match compression_codec {
-            Some(c) => Self::decompress(index_bytes, c)?,
-            None => index_bytes,
+            Some(c) => Self::decompress(data, c)?,
+            None => data,
         };
         Ok(SsTableIndexOwned::new(index_bytes)?)
     }
@@ -466,12 +492,20 @@ impl EncodedSsTableBuilder<'_> {
         if self.num_keys >= self.min_filter_keys {
             let filter = Arc::new(self.filter_builder.build());
             let encoded_filter = filter.encode();
+            // let filter_checksum = crc32fast::hash(&encoded_filter);
             let compressed_filter = match self.compression_codec {
                 None => encoded_filter,
                 Some(c) => Self::compress(encoded_filter, c)?,
             };
+            eprintln!("Compression codec at build: {:?}", self.compression_codec);
+            let filter_checksum = crc32fast::hash(&compressed_filter);
             filter_len = compressed_filter.len();
-            buf.put(compressed_filter);
+            let checksum_size = std::mem::size_of::<u32>();
+            let mut filter_block_with_checksum =
+                BytesMut::with_capacity(filter_len + checksum_size);
+            filter_block_with_checksum.put(compressed_filter);
+            filter_block_with_checksum.put_u32(filter_checksum);
+            buf.put(filter_block_with_checksum);
             maybe_filter = Some(filter);
         }
 
@@ -489,9 +523,14 @@ impl EncodedSsTableBuilder<'_> {
             None => index_block,
             Some(c) => Self::compress(index_block, c)?,
         };
+        let index_checksum = crc32fast::hash(&index_block);
+        let mut index_block_with_checksum = BytesMut::with_capacity(index_block.len() + 4);
+        index_block_with_checksum.put(index_block);
+        index_block_with_checksum.put_u32(index_checksum);
+
         let index_offset = self.current_len + buf.len();
-        let index_len = index_block.len();
-        buf.put(index_block);
+        let index_len = index_block_with_checksum.len();
+        buf.put(index_block_with_checksum);
 
         let meta_offset = self.current_len + buf.len();
         let info = SsTableInfo {
@@ -747,25 +786,63 @@ mod tests {
     async fn test_sstable_with_compression() {
         #[allow(unused)]
         async fn test_compression_inner(compression: CompressionCodec) {
-            let root_path = Path::from("");
+            // Add test ID for debugging
+            let test_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            eprintln!("Test ID: {}", test_id);
+
+            let root_path = Path::from(format!("test_{}", test_id)); // Unique path per test
+            // let root_path = Path::from("");
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let format = SsTableFormat {
-                compression_codec: Some(compression),
+                compression_codec: Some(compression),min_filter_keys: 1,
                 ..SsTableFormat::default()
             };
-            let table_store = TableStore::new(object_store, format, root_path, None);
+            let table_store = TableStore::new(object_store, format.clone(), root_path, None);
             let mut builder = table_store.table_builder();
+            eprintln!("[{}] Created new builder", test_id);
+            // Debug key hashes
+            let key1_hash = filter_hash(b"key1");
+            let key2_hash = filter_hash(b"key2");
+            eprintln!("key1 hash: {:?}", key1_hash);
+            eprintln!("key2 hash: {:?}", key2_hash);
+
             builder.add_value(b"key1", b"value1", gen_attrs(1)).unwrap();
             builder.add_value(b"key2", b"value2", gen_attrs(2)).unwrap();
             let encoded = builder.build().unwrap();
+            if let Some(ref filter) = encoded.filter {
+                eprintln!("Before compression:");
+                eprintln!("  Compression: {:?}", compression);
+                eprintln!("  Filter bits: {:?}", filter.size());
+                eprintln!("  Contains key1: {}", filter.might_contain(key1_hash));
+                eprintln!("  Contains key2: {}", filter.might_contain(key2_hash));
+            }
             let encoded_info = encoded.info.clone();
+
+            if let Some(ref filter) = encoded.filter {
+                eprintln!(
+                    "Write filter contains key1: {} , key2: {}",
+                    filter.might_contain(key1_hash),filter.might_contain(key2_hash)
+                );
+            }
+
             table_store
                 .write_sst(&SsTableId::Wal(0), encoded)
                 .await
                 .unwrap();
+            eprintln!("[{}] Wrote SSTable", test_id);
             let sst_handle = table_store.open_sst(&SsTableId::Wal(0)).await.unwrap();
             let index = table_store.read_index(&sst_handle).await.unwrap();
             let filter = table_store.read_filter(&sst_handle).await.unwrap().unwrap();
+
+            // Debug filter state after decompression
+            eprintln!("After decompression:");
+            eprintln!("  Compression: {:?}", format.compression_codec);
+            eprintln!("  Filter bits: {:?}", filter.size());
+            eprintln!("  Contains key1: {}", filter.might_contain(key1_hash));
+            eprintln!("  Contains key2: {}", filter.might_contain(key2_hash));
 
             assert!(filter.might_contain(filter_hash(b"key1")));
             assert!(filter.might_contain(filter_hash(b"key2")));
