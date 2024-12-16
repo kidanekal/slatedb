@@ -84,8 +84,6 @@ impl SsTableFormat {
         if filter_bytes.len() <= 4 {
             return Err(SlateDBError::EmptyBlockMeta);
         }
-        eprintln!("min_filter_keys: {}", self.min_filter_keys);
-        eprintln!("Compression codec at decode_filter: {:?}", compression_codec.clone());
         if self.min_filter_keys == 0 {
             return Ok(BloomFilter::decode(&filter_bytes));
         }
@@ -96,7 +94,6 @@ impl SsTableFormat {
             .get_u32();
         let actual_checksum = crc32fast::hash(&data);
         if stored_checksum != actual_checksum {
-            println!("Checksum mismatch: stored {} !=  actual {}", stored_checksum, actual_checksum);
             return Err(SlateDBError::ChecksumMismatch);
         }
         let filter_bytes = match compression_codec {
@@ -794,10 +791,10 @@ mod tests {
             eprintln!("Test ID: {}", test_id);
 
             let root_path = Path::from(format!("test_{}", test_id)); // Unique path per test
-            // let root_path = Path::from("");
+                                                                     // let root_path = Path::from("");
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let format = SsTableFormat {
-                compression_codec: Some(compression),min_filter_keys: 1,
+                compression_codec: Some(compression),
                 ..SsTableFormat::default()
             };
             let table_store = TableStore::new(object_store, format.clone(), root_path, None);
@@ -824,7 +821,8 @@ mod tests {
             if let Some(ref filter) = encoded.filter {
                 eprintln!(
                     "Write filter contains key1: {} , key2: {}",
-                    filter.might_contain(key1_hash),filter.might_contain(key2_hash)
+                    filter.might_contain(key1_hash),
+                    filter.might_contain(key2_hash)
                 );
             }
 
